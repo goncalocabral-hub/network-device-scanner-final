@@ -1,7 +1,12 @@
+using LocalDeviceMonitor.App.Modelos;
+using NModbus;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.IO.BACnet;
+using System.IO.BACnet.Serialize;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -12,12 +17,12 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Threading;
 using System.Xml.Linq;
 using Windows.Devices.Bluetooth.Advertisement;
-using System.IO.BACnet;
-using System.IO.BACnet.Serialize;
-using NModbus;
+
+
 
 namespace LocalDeviceMonitor.App;
 
@@ -25,6 +30,8 @@ public partial class MainWindow : Window
 {
     private readonly ObservableCollection<DeviceInfo> _allDevices = new();
     private readonly ObservableCollection<DeviceInfo> _shadowDevices = new();
+    private readonly ObservableCollection<WorkspaceInfo> _workspaces = new();
+    private readonly ObservableCollection<DeviceInfo> _workspaceDevices = new();
     private readonly HashSet<string> _knownDevices = new(StringComparer.OrdinalIgnoreCase);
 
     private int _baselineScanCount = 0;
@@ -32,10 +39,20 @@ public partial class MainWindow : Window
     private bool _baselineEstablished = false;
     private int _newDevicesThisScan = 0;
 
+
     private bool _isDarkMode = false;
     private readonly DispatcherTimer _scanTimer = new();
     private bool _isContinuousScanEnabled = false;
     private bool _isScanRunning = false;
+    private bool _isLoadingWorkspaces = false;
+    private CancellationTokenSource? _scanCts;
+
+    private const int MaxScanDurationSeconds = 30;
+    private const int MaxHostsPerInterface = 128;
+    private const int LanScanConcurrency = 12;
+    private const int ProtocolScanConcurrency = 8;
+
+    private readonly AssetRepository _repo = new();
 
     private static readonly int[] CommonPorts =
     {
@@ -59,7 +76,8 @@ public partial class MainWindow : Window
         { 147, "Universal Electronics, Inc." },
         { 1704, "GD Midea Air-Conditioning Equipment Co., Ltd."},
         { 34818, "Ningbo Joyson Electronic Corp." },
-        { 20 , "Mitsubishi Electric Corporation" }
+        { 20 , "Mitsubishi Electric Corporation" },
+        { 41488, "Xiaomi Inc. " }
     };
 
     private static readonly Dictionary<string, string> OuiVendors = new(StringComparer.OrdinalIgnoreCase)
@@ -118,6 +136,12 @@ public partial class MainWindow : Window
 
         DevicesGrid.ItemsSource = _allDevices;
         ShadowGrid.ItemsSource = _shadowDevices;
+        WorkspaceComboBox.ItemsSource = _workspaces;
+        WorkspaceListBox.ItemsSource = _workspaces;
+        WorkspaceDevicesGrid.ItemsSource = _workspaceDevices;
+
+        DevicesGrid.MouseDoubleClick += DataGrid_MouseDoubleClick;
+        ShadowGrid.MouseDoubleClick += DataGrid_MouseDoubleClick;
 
         OriginComboBox.SelectedIndex = 0;
         StatusTextBlock.Text = "Pronto.";
@@ -125,8 +149,271 @@ public partial class MainWindow : Window
         UpdateShadowCount();
         ApplyLightTheme();
 
-        _scanTimer.Interval = TimeSpan.FromSeconds(12);
+
+        var db = new AssetDatabase();
+        db.EnsureDatabaseCreated();
+
+        LoadFiltroAtributos();
+        LoadWorkspaces();
+
+        _scanTimer.Interval = TimeSpan.FromSeconds(45);
         _scanTimer.Tick += ScanTimer_Tick;
+        Closing += (_, _) =>
+        {
+            _scanTimer.Stop();
+            _scanCts?.Cancel();
+        };
+    }
+
+    private void LoadFiltroAtributos()
+    {
+        var atributos = _repo.GetAtributos();
+
+        atributos.Insert(0, new Atributo
+        {
+            Id = 0,
+            Nome = "Todos"
+        });
+
+        AtributoComboBox.ItemsSource = atributos;
+        AtributoComboBox.SelectedIndex = 0;
+    }
+
+    private void LoadWorkspaces(int? selectedWorkspaceId = null)
+    {
+        _isLoadingWorkspaces = true;
+
+        try
+        {
+            var previousId = selectedWorkspaceId
+                ?? (WorkspaceComboBox.SelectedItem as WorkspaceInfo)?.Id
+                ?? (WorkspaceListBox.SelectedItem as WorkspaceInfo)?.Id;
+
+            _workspaces.Clear();
+
+            foreach (var workspace in _repo.GetWorkspaces())
+                _workspaces.Add(workspace);
+
+            WorkspaceCountText.Text = _workspaces.Count.ToString();
+
+            var selected = previousId.HasValue
+                ? _workspaces.FirstOrDefault(w => w.Id == previousId.Value)
+                : _workspaces.FirstOrDefault();
+
+            WorkspaceComboBox.SelectedItem = selected;
+            WorkspaceListBox.SelectedItem = selected;
+
+            LoadWorkspacePreview(selected);
+        }
+        finally
+        {
+            _isLoadingWorkspaces = false;
+        }
+    }
+
+    private void LoadWorkspacePreview(WorkspaceInfo? workspace)
+    {
+        _workspaceDevices.Clear();
+
+        if (workspace == null)
+        {
+            WorkspaceDeviceCountText.Text = "0 dispositivos";
+            return;
+        }
+
+        foreach (var device in _repo.GetWorkspaceDevices(workspace.Id))
+            _workspaceDevices.Add(device);
+
+        WorkspaceDeviceCountText.Text = $"{_workspaceDevices.Count} dispositivos";
+    }
+
+    private void WorkspaceSelection_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isLoadingWorkspaces)
+            return;
+
+        if (sender == WorkspaceComboBox && WorkspaceComboBox.SelectedItem is WorkspaceInfo comboWorkspace)
+        {
+            WorkspaceListBox.SelectedItem = comboWorkspace;
+            LoadWorkspacePreview(comboWorkspace);
+        }
+        else if (sender == WorkspaceListBox && WorkspaceListBox.SelectedItem is WorkspaceInfo listWorkspace)
+        {
+            WorkspaceComboBox.SelectedItem = listWorkspace;
+            LoadWorkspacePreview(listWorkspace);
+        }
+    }
+
+    private void SaveWorkspace_Click(object sender, RoutedEventArgs e)
+    {
+        if (_allDevices.Count == 0)
+        {
+            ShowToast("Workspace", "Faz um scan antes de guardar.", 3);
+            return;
+        }
+
+        var name = WorkspaceNameTextBox.Text?.Trim();
+
+        if (string.IsNullOrWhiteSpace(name))
+            name = (WorkspaceComboBox.SelectedItem as WorkspaceInfo)?.Name;
+
+        if (string.IsNullOrWhiteSpace(name))
+            name = $"Workspace {_workspaces.Count + 1}";
+
+        var saved = _repo.SaveWorkspaceSnapshot(name, _allDevices);
+        WorkspaceNameTextBox.Text = "";
+        LoadWorkspaces(saved.Id);
+
+        ShowToast("Workspace guardado", $"{saved.Name} ficou com {saved.DeviceCount} dispositivos.", 4);
+    }
+
+    private void LoadWorkspace_Click(object sender, RoutedEventArgs e)
+    {
+        var workspace = WorkspaceComboBox.SelectedItem as WorkspaceInfo
+            ?? WorkspaceListBox.SelectedItem as WorkspaceInfo;
+
+        if (workspace == null)
+        {
+            ShowToast("Workspace", "Seleciona um workspace.", 3);
+            return;
+        }
+
+        var devices = _repo.GetWorkspaceDevices(workspace.Id);
+
+        _allDevices.Clear();
+        _shadowDevices.Clear();
+        _knownDevices.Clear();
+
+        foreach (var device in devices)
+        {
+            _allDevices.Add(device);
+            _knownDevices.Add(BuildSoftDeviceKey(device));
+        }
+
+        _baselineEstablished = true;
+        _baselineScanCount = BaselineScansRequired;
+        _newDevicesThisScan = 0;
+
+        ApplyFilters();
+        UpdateShadowCount();
+        LoadWorkspacePreview(workspace);
+
+        StatusTextBlock.Text = $"Workspace carregado: {workspace.Name}. {_allDevices.Count} dispositivo(s).";
+    }
+
+    private void DeleteWorkspace_Click(object sender, RoutedEventArgs e)
+    {
+        var workspace = WorkspaceComboBox.SelectedItem as WorkspaceInfo
+            ?? WorkspaceListBox.SelectedItem as WorkspaceInfo;
+
+        if (workspace == null)
+        {
+            ShowToast("Workspace", "Seleciona um workspace.", 3);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"Remover o workspace \"{workspace.Name}\"?",
+            "Remover Workspace",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning);
+
+        if (confirm != MessageBoxResult.Yes)
+            return;
+
+        _repo.DeleteWorkspace(workspace.Id);
+        LoadWorkspaces();
+        ShowToast("Workspace removido", workspace.Name, 3);
+    }
+
+    private void DataGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        // 1. Tenta descobrir qual foi o elemento visual exato onde clicaste
+        DependencyObject dep = (DependencyObject)e.OriginalSource;
+
+        // 2. Sobe na "árvore" de elementos do WPF até encontrar a Célula da grelha
+        while (dep != null && !(dep is DataGridCell))
+        {
+            dep = System.Windows.Media.VisualTreeHelper.GetParent(dep);
+        }
+
+        // 3. Se encontrou a célula, extrai o texto e copia para o Clipboard
+        if (dep is DataGridCell cell && cell.Content is TextBlock textBlock)
+        {
+            string valorCopiado = textBlock.Text;
+
+            if (!string.IsNullOrWhiteSpace(valorCopiado))
+            {
+                Clipboard.SetText(valorCopiado);
+
+                // Reutiliza o Toast para avisar que copiou! (Dura 4 segundos)
+                ShowToast("Copiado!", valorCopiado, 4);
+            }
+        }
+    }
+
+
+    private async void PingDevice_Click(object sender, RoutedEventArgs e)
+    {
+        // Verifica se há um dispositivo selecionado e se ele tem IP
+        if (DevicesGrid.SelectedItem is DeviceInfo device && !string.IsNullOrWhiteSpace(device.IpAddress))
+        {
+            ShowToast("A testar ligação...", $"A enviar ping para {device.IpAddress}", 2);
+
+            try
+            {
+                using var ping = new Ping();
+                // Usa SendPingAsync para não congelar a interface enquanto espera!
+                var reply = await ping.SendPingAsync(device.IpAddress, 2000); // Timeout de 2 segundos
+
+                if (reply.Status == IPStatus.Success)
+                {
+                    ShowToast("✅ Ping Sucesso!", $"{device.IpAddress} respondeu em {reply.RoundtripTime}ms", 4);
+                }
+                else
+                {
+                    ShowToast("❌ Ping Falhou", $"O dispositivo não respondeu ({reply.Status})", 4);
+                }
+            }
+            catch (Exception ex)
+            {
+                ShowToast("⚠️ Erro no Ping", ex.Message, 4);
+            }
+        }
+        else
+        {
+            ShowToast("Aviso", "O dispositivo selecionado não tem um endereço IP válido.", 3);
+        }
+    }
+
+    private void OpenBrowser_Click(object sender, RoutedEventArgs e)
+    {
+        // Verifica se há um dispositivo selecionado e se ele tem IP
+        if (DevicesGrid.SelectedItem is DeviceInfo device && !string.IsNullOrWhiteSpace(device.IpAddress))
+        {
+            try
+            {
+                // Constrói o URL (assume HTTP, o próprio browser faz o upgrade para HTTPS se necessário)
+                string url = $"http://{device.IpAddress}";
+
+                // Lança o processo predefinido do Windows para abrir links (o teu browser padrão)
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true
+                });
+
+                ShowToast("A abrir Browser...", $"A redirecionar para {url}", 2);
+            }
+            catch (Exception ex)
+            {
+                ShowToast("⚠️ Erro", $"Não foi possível abrir o browser: {ex.Message}", 4);
+            }
+        }
+        else
+        {
+            ShowToast("Aviso", "O dispositivo selecionado não tem um endereço IP válido.", 3);
+        }
     }
 
     private async void Scan_Click(object sender, RoutedEventArgs e)
@@ -142,8 +429,7 @@ public partial class MainWindow : Window
         }
         else
         {
-            _isContinuousScanEnabled = false;
-            _scanTimer.Stop();
+            StopContinuousScan("Scan continuo a parar...");
             ScanButton.Content = "Iniciar Scan Contínuo";
             StatusTextBlock.Text = "Scan contínuo parado.";
         }
@@ -154,13 +440,24 @@ public partial class MainWindow : Window
         await RunFullScanAsync();
     }
 
+    private void StopContinuousScan(string statusText)
+    {
+        _isContinuousScanEnabled = false;
+        _scanTimer.Stop();
+        _scanCts?.Cancel();
+        ScanButton.Content = "Iniciar Scan Continuo";
+        StatusTextBlock.Text = statusText;
+    }
+
     private async Task RunFullScanAsync()
     {
-        if (_isScanRunning)
-            return;
+        if (_isScanRunning) return;
 
         _isScanRunning = true;
         _newDevicesThisScan = 0;
+        using var scanCts = new CancellationTokenSource(TimeSpan.FromSeconds(MaxScanDurationSeconds));
+        _scanCts = scanCts;
+        var cancellationToken = scanCts.Token;
 
         try
         {
@@ -169,14 +466,15 @@ public partial class MainWindow : Window
             else
                 StatusTextBlock.Text = "A executar scan contínuo...";
 
-            var bleTask = ScanBleAsync();
-            var wifiTask = ScanWifiAsync();
-            var lanTask = ScanLanAsync();
-            var bacnetTask = ScanBacnetAsync();
-            var modbusTask = ScanModbusAsync();
-            var onvifTask = ScanOnvifAsync();
+            var bleTask = ScanBleAsync(cancellationToken);
+            var wifiTask = Task.Run(() => ScanWifiAsync(cancellationToken), cancellationToken);
+            var lanTask = Task.Run(() => ScanLanAsync(cancellationToken), cancellationToken);
+            var bacnetTask = Task.Run(() => ScanBacnetAsync(cancellationToken), cancellationToken);
+            var modbusTask = Task.Run(() => ScanModbusAsync(cancellationToken), cancellationToken);
+            var onvifTask = Task.Run(() => ScanOnvifAsync(cancellationToken), cancellationToken);
 
             await Task.WhenAll(bleTask, wifiTask, lanTask, bacnetTask, modbusTask, onvifTask);
+            cancellationToken.ThrowIfCancellationRequested();
 
             var currentScanDevices = new List<DeviceInfo>();
             currentScanDevices.AddRange(bleTask.Result);
@@ -186,7 +484,25 @@ public partial class MainWindow : Window
             currentScanDevices.AddRange(modbusTask.Result);
             currentScanDevices.AddRange(onvifTask.Result);
 
-            ProcessDiscoveredDevices(currentScanDevices);
+            // ✅ Enriquecimento pesado fora da UI thread
+            await Task.Run(() =>
+            {
+                foreach (var device in currentScanDevices)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    device.LastSeen = DateTime.Now;
+                    device.Status = "Online";
+                    EnrichManufacturerFromMac(device);
+                    ClassifyDevice(device);
+                }
+            }, cancellationToken);
+
+            // ✅ Só o que toca na UI fica aqui (ObservableCollection exige UI thread)
+            foreach (var device in currentScanDevices)
+            {
+                RegisterShadowDevice(device);
+                UpsertDevice(device);
+            }
 
             MarkOfflineDevices();
             ApplyFilters();
@@ -195,60 +511,130 @@ public partial class MainWindow : Window
             if (!_baselineEstablished)
             {
                 _baselineScanCount++;
-
                 if (_baselineScanCount >= BaselineScansRequired)
                 {
                     _baselineEstablished = true;
-                    StatusTextBlock.Text =
-                        $"Baseline concluída. {_allDevices.Count} dispositivo(s) conhecidos.";
+                    StatusTextBlock.Text = $"Baseline concluída. {_allDevices.Count} dispositivo(s) conhecidos.";
                 }
                 else
                 {
-                    StatusTextBlock.Text =
-                        $"Baseline em curso... scan {_baselineScanCount}/{BaselineScansRequired}. {_allDevices.Count} dispositivo(s) aprendidos.";
+                    StatusTextBlock.Text = $"Baseline em curso... scan {_baselineScanCount}/{BaselineScansRequired}. {_allDevices.Count} dispositivo(s) aprendidos.";
                 }
             }
             else
             {
-                StatusTextBlock.Text =
-                    $"Scan atualizado. {_allDevices.Count} registo(s), {_allDevices.Count(d => d.Status == "Online")} online.";
+                StatusTextBlock.Text = $"Scan atualizado. {_allDevices.Count} registo(s), {_allDevices.Count(d => d.Status == "Online")} online.";
 
                 if (_newDevicesThisScan > 0)
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        MessageBox.Show(
-                            $"{_newDevicesThisScan} novos dispositivos detetados",
-                            "Shadow IT Detection",
-                            MessageBoxButton.OK,
-                            MessageBoxImage.Warning);
-                    });
-                }
+                    ShowToast("Shadow IT Detection", $"{_newDevicesThisScan} novos dispositivos detetados", 6);
             }
+        }
+        catch (OperationCanceledException)
+        {
+            StatusTextBlock.Text = _isContinuousScanEnabled
+                ? "Scan cancelado por timeout; proximo ciclo continua."
+                : "Scan continuo parado.";
         }
         catch (Exception ex)
         {
             StatusTextBlock.Text = "Erro no scan.";
-            MessageBox.Show(
-                $"Erro ao executar scan: {ex.Message}",
-                "Erro",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
+            MessageBox.Show($"Erro ao executar scan: {ex.Message}", "Erro", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
         {
+            if (ReferenceEquals(_scanCts, scanCts))
+                _scanCts = null;
+
             _isScanRunning = false;
         }
     }
 
-    private async Task<List<DeviceInfo>> DiscoverDevicesAsync()
+    private async void ShowToast(string title, string message, int durationSeconds = 3)
     {
-        var bleTask = ScanBleAsync();
-        var wifiTask = ScanWifiAsync();
-        var lanTask = ScanLanAsync();
-        var bacnetTask = ScanBacnetAsync();
-        var modbusTask = ScanModbusAsync();
-        var onvifTask = ScanOnvifAsync();
+        // Cria uma janela invisível e flutuante
+        var toastWindow = new Window
+        {
+            WindowStyle = WindowStyle.None,
+            AllowsTransparency = true,
+            Background = System.Windows.Media.Brushes.Transparent,
+            Topmost = true,
+            ShowActivated = false, // Não rouba o foco
+            ShowInTaskbar = false,
+            SizeToContent = SizeToContent.WidthAndHeight,
+            IsHitTestVisible = false // Impede que bloqueie cliques noutras coisas
+        };
+
+        // Estiliza o "card" do Toast usando as tuas cores do tema
+        var border = new Border
+        {
+            Background = (System.Windows.Media.Brush)FindResource("CardBrush"),
+            BorderBrush = (System.Windows.Media.Brush)FindResource("BorderBrushTheme"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Margin = new Thickness(15),
+            Padding = new Thickness(20, 15, 20, 15),
+            Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                BlurRadius = 15,
+                ShadowDepth = 4,
+                Opacity = 0.2
+            }
+        };
+
+        var stack = new StackPanel();
+
+        // Título
+        stack.Children.Add(new TextBlock
+        {
+            Text = title,
+            FontWeight = FontWeights.Bold,
+            FontSize = 14,
+            Foreground = (System.Windows.Media.Brush)FindResource("PrimaryTextBrush"),
+            Margin = new Thickness(0, 0, 0, 5)
+        });
+
+        // Mensagem
+        stack.Children.Add(new TextBlock
+        {
+            Text = message,
+            Foreground = (System.Windows.Media.Brush)FindResource("SecondaryTextBrush")
+        });
+
+        border.Child = stack;
+        toastWindow.Content = border;
+
+        // Posiciona o Toast no canto inferior direito da tua MainWindow
+        toastWindow.Loaded += (s, e) =>
+        {
+            toastWindow.Left = this.Left + this.ActualWidth - toastWindow.ActualWidth - 20;
+            toastWindow.Top = this.Top + this.ActualHeight - toastWindow.ActualHeight - 20;
+        };
+
+        // Mostra o Toast
+        toastWindow.Show();
+
+        // Espera os segundos definidos
+        await Task.Delay(durationSeconds * 1000);
+
+        // Animação de fade-out rápida
+        while (toastWindow.Opacity > 0)
+        {
+            toastWindow.Opacity -= 0.1;
+            await Task.Delay(20);
+        }
+
+        toastWindow.Close();
+    }
+
+
+    private async Task<List<DeviceInfo>> DiscoverDevicesAsync(CancellationToken cancellationToken = default)
+    {
+        var bleTask = ScanBleAsync(cancellationToken);
+        var wifiTask = ScanWifiAsync(cancellationToken);
+        var lanTask = ScanLanAsync(cancellationToken);
+        var bacnetTask = ScanBacnetAsync(cancellationToken);
+        var modbusTask = ScanModbusAsync(cancellationToken);
+        var onvifTask = ScanOnvifAsync(cancellationToken);
 
         await Task.WhenAll(bleTask, wifiTask, lanTask, bacnetTask, modbusTask, onvifTask);
 
@@ -361,18 +747,6 @@ public partial class MainWindow : Window
             return true;
         }
 
-        // 5. Fabricante + tipo + origem
-        if (!string.IsNullOrWhiteSpace(a.Manufacturer) &&
-            !string.IsNullOrWhiteSpace(b.Manufacturer) &&
-            !string.IsNullOrWhiteSpace(a.DeviceType) &&
-            !string.IsNullOrWhiteSpace(b.DeviceType) &&
-            string.Equals(NormalizeValue(a.Manufacturer), NormalizeValue(b.Manufacturer), StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(NormalizeValue(a.DeviceType), NormalizeValue(b.DeviceType), StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(NormalizeValue(a.Origin), NormalizeValue(b.Origin), StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
         return false;
     }
 
@@ -381,7 +755,6 @@ public partial class MainWindow : Window
         string origin = NormalizeValue(device.Origin);
         string name = NormalizeValue(device.Name);
         string manufacturer = NormalizeValue(device.Manufacturer);
-        string deviceType = NormalizeValue(device.DeviceType);
 
         if (!string.IsNullOrWhiteSpace(device.MacAddress))
             return $"mac:{NormalizeValue(device.MacAddress)}";
@@ -395,7 +768,7 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(device.IpAddress) && !string.IsNullOrWhiteSpace(name))
             return $"ipn:{origin}|{NormalizeValue(device.IpAddress)}|{name}";
 
-        return $"fallback:{origin}|{manufacturer}|{deviceType}|{name}";
+        return $"fallback:{origin}|{name}";
     }
 
     private static string NormalizeValue(string? value)
@@ -423,8 +796,10 @@ public partial class MainWindow : Window
         existing.Manufacturer = scannedDevice.Manufacturer;
         existing.MacAddress = scannedDevice.MacAddress;
         existing.IpAddress = scannedDevice.IpAddress;
+
         existing.Status = "Online";
         existing.LastSeen = DateTime.Now;
+
         existing.Protocol = scannedDevice.Protocol;
         existing.Rssi = scannedDevice.Rssi;
         existing.EstimatedDistanceMeters = scannedDevice.EstimatedDistanceMeters;
@@ -473,7 +848,6 @@ public partial class MainWindow : Window
         ApplyFilters();
         StatusTextBlock.Text = $"Filtros limpos. {_allDevices.Count} registo(s) disponíveis.";
     }
-
     private void Filter_Changed(object sender, EventArgs e)
     {
         if (!IsLoaded)
@@ -482,9 +856,9 @@ public partial class MainWindow : Window
         ApplyFilters();
     }
 
-    private async Task<List<DeviceInfo>> ScanBleAsync()
+    private async Task<List<DeviceInfo>> ScanBleAsync(CancellationToken cancellationToken)
     {
-        var result = new Dictionary<ulong, DeviceInfo>();
+        var result = new ConcurrentDictionary<ulong, DeviceInfo>(); ;
 
         var watcher = new BluetoothLEAdvertisementWatcher
         {
@@ -524,22 +898,28 @@ public partial class MainWindow : Window
         }
 
         watcher.Received += OnReceived;
-        watcher.Start();
-        await Task.Delay(5000);
-        watcher.Stop();
-        watcher.Received -= OnReceived;
+        try
+        {
+            watcher.Start();
+            await Task.Delay(4000, cancellationToken);
+        }
+        finally
+        {
+            watcher.Stop();
+            watcher.Received -= OnReceived;
+        }
 
         return result.Values
             .OrderByDescending(d => d.Rssi ?? int.MinValue)
             .ToList();
     }
 
-    private async Task<List<DeviceInfo>> ScanWifiAsync()
+    private async Task<List<DeviceInfo>> ScanWifiAsync(CancellationToken cancellationToken)
     {
         var list = new List<DeviceInfo>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var output = await ExecuteCommandAsync("netsh", "wlan show networks mode=bssid");
+        var output = await ExecuteCommandAsync("netsh", "wlan show networks mode=bssid", cancellationToken);
 
         string? currentSsid = null;
         string? currentBssid = null;
@@ -547,6 +927,7 @@ public partial class MainWindow : Window
 
         foreach (var raw in output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var line = raw.Trim();
 
             if (line.StartsWith("SSID ", StringComparison.OrdinalIgnoreCase))
@@ -594,7 +975,7 @@ public partial class MainWindow : Window
             }
         }
 
-        var arpOutput = await ExecuteCommandAsync("arp", "-a");
+        var arpOutput = await ExecuteCommandAsync("arp", "-a", cancellationToken);
         var arpRegex = new Regex(@"(?<ip>\d+\.\d+\.\d+\.\d+)\s+(?<mac>([0-9a-f]{2}-){5}[0-9a-f]{2})", RegexOptions.IgnoreCase);
 
         var arpMap = arpRegex.Matches(arpOutput)
@@ -621,16 +1002,17 @@ public partial class MainWindow : Window
                 continue;
 
             var localIp = uni.Address.ToString();
-            var hosts = EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(254).ToList();
+            var hosts = EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(MaxHostsPerInterface).ToList();
 
-            var semaphore = new SemaphoreSlim(35);
+            var semaphore = new SemaphoreSlim(LanScanConcurrency);
 
             var pingTasks = hosts.Select(async ip =>
             {
-                await semaphore.WaitAsync();
+                await semaphore.WaitAsync(cancellationToken);
 
                 try
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     using var ping = new Ping();
                     var reply = await ping.SendPingAsync(ip, 150);
                     if (reply.Status != IPStatus.Success)
@@ -643,7 +1025,7 @@ public partial class MainWindow : Window
                     string hostName;
                     try
                     {
-                        hostName = (await Dns.GetHostEntryAsync(ip)).HostName;
+                        hostName = await ResolveHostNameAsync(ip, $"WiFi Client {ipText}", cancellationToken);
                     }
                     catch
                     {
@@ -653,7 +1035,7 @@ public partial class MainWindow : Window
                     arpMap.TryGetValue(ipText, out string? mac);
                     var vendor = GetVendorFromMac(mac);
 
-                    var portInfo = await DetectCommonPortsAsync(ipText);
+                    var portInfo = await DetectCommonPortsAsync(ipText, cancellationToken);
 
                     var device = new DeviceInfo
                     {
@@ -670,6 +1052,10 @@ public partial class MainWindow : Window
                     };
 
                     return device;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch
                 {
@@ -693,7 +1079,7 @@ public partial class MainWindow : Window
         return list.OrderBy(d => d.Name).ToList();
     }
 
-    private async Task<List<DeviceInfo>> ScanLanAsync()
+    private async Task<List<DeviceInfo>> ScanLanAsync(CancellationToken cancellationToken)
     {
         var list = new List<DeviceInfo>();
         var ipStrings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -713,15 +1099,16 @@ public partial class MainWindow : Window
             if (uni == null || uni.IPv4Mask == null)
                 continue;
 
-            var hosts = EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(254).ToList();
-            var semaphore = new SemaphoreSlim(35);
+            var hosts = EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(MaxHostsPerInterface).ToList();
+            var semaphore = new SemaphoreSlim(LanScanConcurrency);
 
             var pingTasks = hosts.Select(async ip =>
             {
-                await semaphore.WaitAsync();
+                await semaphore.WaitAsync(cancellationToken);
 
                 try
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     using var ping = new Ping();
                     var reply = await ping.SendPingAsync(ip, 180);
                     if (reply.Status != IPStatus.Success)
@@ -730,14 +1117,14 @@ public partial class MainWindow : Window
                     string hostName;
                     try
                     {
-                        hostName = (await Dns.GetHostEntryAsync(ip)).HostName;
+                        hostName = await ResolveHostNameAsync(ip, ip.ToString(), cancellationToken);
                     }
                     catch
                     {
                         hostName = ip.ToString();
                     }
 
-                    var portInfo = await DetectCommonPortsAsync(ip.ToString());
+                    var portInfo = await DetectCommonPortsAsync(ip.ToString(), cancellationToken);
 
                     var device = new DeviceInfo
                     {
@@ -753,6 +1140,10 @@ public partial class MainWindow : Window
                     };
 
                     return device;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch
                 {
@@ -773,7 +1164,7 @@ public partial class MainWindow : Window
             }
         }
 
-        var arpOutput = await ExecuteCommandAsync("arp", "-a");
+        var arpOutput = await ExecuteCommandAsync("arp", "-a", cancellationToken);
         var arpRegex = new Regex(@"(?<ip>\d+\.\d+\.\d+\.\d+)\s+(?<mac>([0-9a-f]{2}-){5}[0-9a-f]{2})", RegexOptions.IgnoreCase);
 
         foreach (Match m in arpRegex.Matches(arpOutput))
@@ -789,7 +1180,7 @@ public partial class MainWindow : Window
             }
             else if (ipStrings.Add(ip))
             {
-                var portInfo = await DetectCommonPortsAsync(ip);
+                var portInfo = await DetectCommonPortsAsync(ip, cancellationToken);
                 var vendor = GetVendorFromMac(mac);
 
                 var device = new DeviceInfo
@@ -813,7 +1204,7 @@ public partial class MainWindow : Window
         return list;
     }
 
-    private async Task<List<DeviceInfo>> ScanBacnetAsync()
+    private async Task<List<DeviceInfo>> ScanBacnetAsync(CancellationToken cancellationToken)
     {
         var list = new List<DeviceInfo>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -825,6 +1216,7 @@ public partial class MainWindow : Window
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 client = new BacnetClient(new BacnetIpUdpProtocolTransport(0xBAC0, false));
 
                 client.OnIam += (BacnetClient sender, BacnetAddress adr, uint deviceId, uint maxApdu, BacnetSegmentations segmentation, ushort vendorId) =>
@@ -890,7 +1282,11 @@ public partial class MainWindow : Window
                 client.Start();
                 client.WhoIs();
 
-                await Task.Delay(6000);
+                await Task.Delay(4000, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
@@ -902,7 +1298,7 @@ public partial class MainWindow : Window
                     try { client.Dispose(); } catch { }
                 }
             }
-        });
+        }, cancellationToken);
 
         var candidateIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -922,19 +1318,20 @@ public partial class MainWindow : Window
             if (uni == null || uni.IPv4Mask == null)
                 continue;
 
-            foreach (var ip in EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(254))
+            foreach (var ip in EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(MaxHostsPerInterface))
                 candidateIps.Add(ip.ToString());
         }
 
-        var semaphore = new SemaphoreSlim(45);
+        var semaphore = new SemaphoreSlim(ProtocolScanConcurrency);
 
         var portChecks = candidateIps.Select(async ip =>
         {
-            await semaphore.WaitAsync();
+            await semaphore.WaitAsync(cancellationToken);
 
             try
             {
-                bool open = await IsUdpLikelyBacnetAsync(ip, 47808);
+                cancellationToken.ThrowIfCancellationRequested();
+                bool open = await IsUdpLikelyBacnetAsync(ip, 47808, cancellationToken);
                 if (!open)
                     return null;
 
@@ -960,6 +1357,10 @@ public partial class MainWindow : Window
                     LastSeen = DateTime.Now
                 };
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch
             {
                 return null;
@@ -982,7 +1383,7 @@ public partial class MainWindow : Window
             .ToList();
     }
 
-    private async Task<bool> IsUdpLikelyBacnetAsync(string ipAddress, int port)
+    private async Task<bool> IsUdpLikelyBacnetAsync(string ipAddress, int port, CancellationToken cancellationToken)
     {
         try
         {
@@ -991,20 +1392,17 @@ public partial class MainWindow : Window
             udp.Connect(ipAddress, port);
 
             var data = new byte[] { 0x81, 0x0b, 0x00, 0x0c, 0x01, 0x20, 0xff, 0xff, 0x00, 0xff, 0x10, 0x08 };
-            await udp.SendAsync(data, data.Length);
+            await udp.SendAsync(data, data.Length).ConfigureAwait(false);
 
             var receiveTask = udp.ReceiveAsync();
-            var completed = await Task.WhenAny(receiveTask, Task.Delay(700));
-
+            var completed = await Task.WhenAny(receiveTask, Task.Delay(500, cancellationToken)).ConfigureAwait(false);
             return completed == receiveTask;
         }
-        catch
-        {
-            return false;
-        }
+        catch (OperationCanceledException) { throw; }
+        catch { return false; }
     }
 
-    private async Task<List<DeviceInfo>> ScanModbusAsync()
+    private async Task<List<DeviceInfo>> ScanModbusAsync(CancellationToken cancellationToken)
     {
         var list = new List<DeviceInfo>();
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1026,22 +1424,23 @@ public partial class MainWindow : Window
             if (uni == null || uni.IPv4Mask == null)
                 continue;
 
-            foreach (var ip in EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(254))
+            foreach (var ip in EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(MaxHostsPerInterface))
                 candidateIps.Add(ip.ToString());
         }
 
-        var semaphore = new SemaphoreSlim(25);
+        var semaphore = new SemaphoreSlim(ProtocolScanConcurrency);
 
         var tasks = candidateIps.Select(async ip =>
         {
-            await semaphore.WaitAsync();
+            await semaphore.WaitAsync(cancellationToken);
 
             try
             {
-                if (!await IsTcpPortOpenAsync(ip, 502, 500))
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!await IsTcpPortOpenAsync(ip, 502, 350, cancellationToken))
                     return new List<DeviceInfo>();
 
-                var devices = await TryReadModbusDevicesAsync(ip);
+                var devices = await TryReadModbusDevicesAsync(ip, cancellationToken);
 
                 if (devices.Count == 0)
                 {
@@ -1064,6 +1463,10 @@ public partial class MainWindow : Window
                 }
 
                 return devices;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
@@ -1089,7 +1492,7 @@ public partial class MainWindow : Window
         return list.OrderBy(d => d.Name).ToList();
     }
 
-    private async Task<List<DeviceInfo>> TryReadModbusDevicesAsync(string ip)
+    private async Task<List<DeviceInfo>> TryReadModbusDevicesAsync(string ip, CancellationToken cancellationToken)
     {
         var devices = new List<DeviceInfo>();
 
@@ -1098,28 +1501,30 @@ public partial class MainWindow : Window
             using var tcpClient = new TcpClient();
 
             var connectTask = tcpClient.ConnectAsync(ip, 502);
-            var completed = await Task.WhenAny(connectTask, Task.Delay(1200));
+            var completed = await Task.WhenAny(connectTask, Task.Delay(800, cancellationToken));
 
             if (completed != connectTask || !tcpClient.Connected)
                 return devices;
 
             var factory = new ModbusFactory();
             using var master = factory.CreateMaster(tcpClient);
-            master.Transport.ReadTimeout = 1000;
-            master.Transport.WriteTimeout = 1000;
+            master.Transport.ReadTimeout = 300;
+            master.Transport.WriteTimeout = 300;
             master.Transport.Retries = 0;
 
-            for (byte unitId = 1; unitId <= 20; unitId++)
+            for (byte unitId = 1; unitId <= 5; unitId++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var summaries = new List<string>();
                 bool found = false;
 
-                ushort[] candidateAddresses = { 0, 1, 10, 20, 100, 300, 400, 1000 };
+                ushort[] candidateAddresses = { 0, 1, 100, 400 };
 
                 foreach (var address in candidateAddresses)
                 {
                     try
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var regs = master.ReadHoldingRegisters(unitId, address, 6);
                         if (regs != null && regs.Length > 0)
                         {
@@ -1142,6 +1547,7 @@ public partial class MainWindow : Window
                     {
                         try
                         {
+                            cancellationToken.ThrowIfCancellationRequested();
                             var regs = master.ReadInputRegisters(unitId, address, 6);
                             if (regs != null && regs.Length > 0)
                             {
@@ -1181,6 +1587,10 @@ public partial class MainWindow : Window
                 });
             }
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch
         {
         }
@@ -1188,7 +1598,7 @@ public partial class MainWindow : Window
         return devices;
     }
 
-    private async Task<List<DeviceInfo>> ScanOnvifAsync()
+    private async Task<List<DeviceInfo>> ScanOnvifAsync(CancellationToken cancellationToken)
     {
         var list = new List<DeviceInfo>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1199,6 +1609,7 @@ public partial class MainWindow : Window
 
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 udp = new UdpClient(AddressFamily.InterNetwork);
                 udp.EnableBroadcast = true;
                 udp.MulticastLoopback = false;
@@ -1210,7 +1621,7 @@ public partial class MainWindow : Window
                 var multicastEndpoint = new IPEndPoint(IPAddress.Parse("239.255.255.250"), 3702);
                 await udp.SendAsync(probeBytes, probeBytes.Length, multicastEndpoint);
 
-                await Task.Delay(150);
+                await Task.Delay(100, cancellationToken);
 
                 var broadcastEndpoint = new IPEndPoint(IPAddress.Broadcast, 3702);
                 await udp.SendAsync(probeBytes, probeBytes.Length, broadcastEndpoint);
@@ -1227,12 +1638,12 @@ public partial class MainWindow : Window
                     }
                 }
 
-                var stopAt = DateTime.UtcNow.AddSeconds(6);
+                var stopAt = DateTime.UtcNow.AddSeconds(4);
 
-                while (DateTime.UtcNow < stopAt)
+                while (DateTime.UtcNow < stopAt && !cancellationToken.IsCancellationRequested)
                 {
                     var receiveTask = udp.ReceiveAsync();
-                    var completed = await Task.WhenAny(receiveTask, Task.Delay(500));
+                    var completed = await Task.WhenAny(receiveTask, Task.Delay(350, cancellationToken));
 
                     if (completed != receiveTask)
                         continue;
@@ -1265,7 +1676,7 @@ public partial class MainWindow : Window
                     if (!seen.Add(key))
                         continue;
 
-                    var portInfo = await DetectOnvifServicePortsAsync(parsed.Value.Ip);
+                    var portInfo = await DetectOnvifServicePortsAsync(parsed.Value.Ip, cancellationToken);
 
                     string manufacturer = BuildOnvifManufacturer(parsed.Value);
                     string displayName = BuildOnvifDisplayName(parsed.Value);
@@ -1303,6 +1714,10 @@ public partial class MainWindow : Window
                     });
                 }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch
             {
             }
@@ -1310,7 +1725,7 @@ public partial class MainWindow : Window
             {
                 udp?.Dispose();
             }
-        });
+        }, cancellationToken);
 
         var candidateIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1330,19 +1745,20 @@ public partial class MainWindow : Window
             if (uni == null || uni.IPv4Mask == null)
                 continue;
 
-            foreach (var ip in EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(254))
+            foreach (var ip in EnumerateSubnetHosts(uni.Address, uni.IPv4Mask).Take(MaxHostsPerInterface))
                 candidateIps.Add(ip.ToString());
         }
 
-        var semaphore = new SemaphoreSlim(35);
+        var semaphore = new SemaphoreSlim(ProtocolScanConcurrency);
 
         var fallbackTasks = candidateIps.Select(async ip =>
         {
-            await semaphore.WaitAsync();
+            await semaphore.WaitAsync(cancellationToken);
 
             try
             {
-                bool responds = await IsUdpLikelyOnvifAsync(ip, 3702);
+                cancellationToken.ThrowIfCancellationRequested();
+                bool responds = await IsUdpLikelyOnvifAsync(ip, 3702, cancellationToken);
                 if (!responds)
                     return null;
 
@@ -1350,7 +1766,7 @@ public partial class MainWindow : Window
                 if (!seen.Add(key))
                     return null;
 
-                var portInfo = await DetectOnvifServicePortsAsync(ip);
+                var portInfo = await DetectOnvifServicePortsAsync(ip, cancellationToken);
 
                 var ports = new List<string> { "3702" };
                 if (!string.IsNullOrWhiteSpace(portInfo.bestPort) && !ports.Contains(portInfo.bestPort))
@@ -1371,6 +1787,10 @@ public partial class MainWindow : Window
                     Protocol = "ONVIF",
                     LastSeen = DateTime.Now
                 };
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch
             {
@@ -1394,7 +1814,7 @@ public partial class MainWindow : Window
             .ToList();
     }
 
-    private async Task<bool> IsUdpLikelyOnvifAsync(string ipAddress, int port)
+    private async Task<bool> IsUdpLikelyOnvifAsync(string ipAddress, int port, CancellationToken cancellationToken)
     {
         try
         {
@@ -1409,7 +1829,7 @@ public partial class MainWindow : Window
             await udp.SendAsync(data, data.Length);
 
             var receiveTask = udp.ReceiveAsync();
-            var completed = await Task.WhenAny(receiveTask, Task.Delay(800));
+            var completed = await Task.WhenAny(receiveTask, Task.Delay(500, cancellationToken));
 
             if (completed != receiveTask)
                 return false;
@@ -1424,26 +1844,31 @@ public partial class MainWindow : Window
                    xml.Contains("ProbeMatch", StringComparison.OrdinalIgnoreCase) ||
                    xml.Contains("onvif", StringComparison.OrdinalIgnoreCase);
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch
         {
             return false;
         }
     }
 
-    private async Task<(string bestPort, string services)> DetectOnvifServicePortsAsync(string ip)
+    private async Task<(string bestPort, string services)> DetectOnvifServicePortsAsync(string ip, CancellationToken cancellationToken)
     {
-        var open = new List<int>();
         int[] onvifPorts = { 80, 443, 554, 8080, 8000, 8899 };
 
-        foreach (var port in onvifPorts)
+        var checks = onvifPorts.Select(async port =>
         {
-            if (await IsTcpPortOpenAsync(ip, port, 250))
-                open.Add(port);
-        }
+            bool isOpen = await IsTcpPortOpenAsync(ip, port, 200, cancellationToken).ConfigureAwait(false);
+            return new { Port = port, IsOpen = isOpen };
+        });
+
+        var results = await Task.WhenAll(checks).ConfigureAwait(false);
+        var open = results.Where(r => r.IsOpen).Select(r => r.Port).ToList();
 
         string bestPort = open.Count > 0 ? open.First().ToString() : "";
         string services = string.Join(", ", open.Select(GetServiceName));
-
         return (bestPort, services);
     }
 
@@ -1688,59 +2113,62 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
         }
     }
 
-    private async Task<(string openPorts, string services)> DetectCommonPortsAsync(string ipAddress)
-    {
-        var openPorts = new List<int>();
 
+
+    private async Task<bool> IsTcpPortOpenAsync(string ipAddress, int port, int timeoutMs, CancellationToken cancellationToken)
+    {
+        using var timeoutCts = new CancellationTokenSource(timeoutMs);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
+        try
+        {
+            using var tcpClient = new TcpClient();
+            await tcpClient.ConnectAsync(ipAddress, port, linkedCts.Token).ConfigureAwait(false);
+            return tcpClient.Connected;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return false; }
+    }
+
+    private async Task<(string openPorts, string services)> DetectCommonPortsAsync(string ipAddress, CancellationToken cancellationToken)
+    {
         var checks = CommonPorts.Select(async port =>
         {
-            bool isOpen = await IsTcpPortOpenAsync(ipAddress, port, 180);
+            bool isOpen = await IsTcpPortOpenAsync(ipAddress, port, 150, cancellationToken).ConfigureAwait(false);
             return new { Port = port, IsOpen = isOpen };
         });
 
-        var results = await Task.WhenAll(checks);
+        var results = await Task.WhenAll(checks).ConfigureAwait(false);
+        var openPorts = results.Where(r => r.IsOpen).Select(r => r.Port).OrderBy(p => p).ToList();
 
-        foreach (var result in results)
-        {
-            if (result.IsOpen)
-                openPorts.Add(result.Port);
-        }
-
-        openPorts = openPorts.OrderBy(p => p).ToList();
-
-        string portsText = openPorts.Count > 0
-            ? string.Join(", ", openPorts)
-            : "Nenhuma";
-
-        string servicesText = openPorts.Count > 0
-            ? string.Join(", ", openPorts.Select(GetServiceName))
-            : "Nenhum";
+        string portsText = openPorts.Count > 0 ? string.Join(", ", openPorts) : "Nenhuma";
+        string servicesText = openPorts.Count > 0 ? string.Join(", ", openPorts.Select(GetServiceName)) : "Nenhum";
 
         return (portsText, servicesText);
     }
 
-    private async Task<bool> IsTcpPortOpenAsync(string ipAddress, int port, int timeoutMs)
+    private static async Task<string> ResolveHostNameAsync(IPAddress ip, string fallback, CancellationToken cancellationToken)
     {
         try
         {
-            using var tcpClient = new TcpClient();
-
-            var connectTask = tcpClient.ConnectAsync(ipAddress, port);
-            var timeoutTask = Task.Delay(timeoutMs);
-
-            var completedTask = await Task.WhenAny(connectTask, timeoutTask);
-
-            if (completedTask == timeoutTask)
-                return false;
-
-            await connectTask;
-            return tcpClient.Connected;
+            var lookupTask = Dns.GetHostEntryAsync(ip);
+            var completed = await Task.WhenAny(lookupTask, Task.Delay(250, cancellationToken)).ConfigureAwait(false);
+            return completed == lookupTask ? lookupTask.Result.HostName : fallback;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch
         {
-            return false;
+            return fallback;
         }
     }
+
+ 
 
     private string GetServiceName(int port)
     {
@@ -1881,20 +2309,47 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 
     private void ApplyFilters()
     {
+        /*
+        if (ComboFiltroAtributo.SelectedValue is int id && id > 0)
+            _atributoFiltroId = id;
+        else
+            _atributoFiltroId = null;
+
+        _ativosView.Refresh();
+        */
+
+        var selectedAtributo = GetSelectedAtributo();
+
+
         var selectedOrigin = GetSelectedOrigin();
         var nameFilter = NameFilterTextBox.Text?.Trim() ?? string.Empty;
         var manufacturerFilter = ManufacturerFilterTextBox.Text?.Trim() ?? string.Empty;
 
         IEnumerable<DeviceInfo> query = _allDevices;
 
+        // if (!string.Equals(selectedAtributo, "Todos", StringComparison.OrdinalIgnoreCase))
+            //query = query.Where(d => string.Equals(d.Atributos, selectedOrigin, StringComparison.OrdinalIgnoreCase));
+
+
         if (!string.Equals(selectedOrigin, "Todas", StringComparison.OrdinalIgnoreCase))
             query = query.Where(d => string.Equals(d.Origin, selectedOrigin, StringComparison.OrdinalIgnoreCase));
 
+        // Filtro do Nome ou IP (Pesquisa nos dois campos ao mesmo tempo)
         if (!string.IsNullOrWhiteSpace(nameFilter))
-            query = query.Where(d => (d.Name ?? "").Contains(nameFilter, StringComparison.OrdinalIgnoreCase));
+        {
+            query = query.Where(d =>
+                (d.Name ?? "").Contains(nameFilter, StringComparison.OrdinalIgnoreCase) ||
+                (d.IpAddress ?? "").Contains(nameFilter, StringComparison.OrdinalIgnoreCase)
+            );
+        }
 
         if (!string.IsNullOrWhiteSpace(manufacturerFilter))
             query = query.Where(d => (d.Manufacturer ?? "").Contains(manufacturerFilter, StringComparison.OrdinalIgnoreCase));
+
+        if (!string.Equals(selectedAtributo, "Todos", StringComparison.OrdinalIgnoreCase))
+        {
+            query = query.Where(d => string.Equals(d.AtributoAtual?.Trim(), selectedAtributo.Trim(), StringComparison.OrdinalIgnoreCase));
+        }
 
         var filteredList = query
             .OrderByDescending(d => d.Status.Equals("Online", StringComparison.OrdinalIgnoreCase))
@@ -1911,13 +2366,27 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
         var list = devices.ToList();
 
         TotalCountText.Text = list.Count.ToString();
-        BluetoothCountText.Text = list.Count(d => d.Origin.Equals("Bluetooth", StringComparison.OrdinalIgnoreCase)).ToString();
-        WifiCountText.Text = list.Count(d => d.Origin.Equals("WIFI", StringComparison.OrdinalIgnoreCase)).ToString();
-        LanCountText.Text = list.Count(d => d.Origin.Equals("LAN", StringComparison.OrdinalIgnoreCase)).ToString();
-        BacnetCountText.Text = list.Count(d => d.Origin.Equals("BACNET", StringComparison.OrdinalIgnoreCase)).ToString();
-        ModbusCountText.Text = list.Count(d => d.Origin.Equals("MODBUS", StringComparison.OrdinalIgnoreCase)).ToString();
-        OnvifCountText.Text = list.Count(d => d.Origin.Equals("ONVIF", StringComparison.OrdinalIgnoreCase)).ToString();
-        OnlineCountText.Text = list.Count(d => d.Status.Equals("Online", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        BluetoothCountText.Text = list.
+            Count(d => d.Origin.Equals("Bluetooth", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        WifiCountText.Text = list.
+            Count(d => d.Origin.Equals("WIFI", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        LanCountText.Text = list.
+            Count(d => d.Origin.Equals("LAN", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        BacnetCountText.Text = list.
+            Count(d => d.Origin.Equals("BACNET", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        ModbusCountText.Text = list.
+            Count(d => d.Origin.Equals("MODBUS", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        OnvifCountText.Text = list.
+            Count(d => d.Origin.Equals("ONVIF", StringComparison.OrdinalIgnoreCase)).ToString();
+        
+        OnlineCountText.Text = list.
+            Count(d => d.Status.Equals("Online", StringComparison.OrdinalIgnoreCase)).ToString();
     }
 
     private void UpdateShadowCount()
@@ -2102,8 +2571,18 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 
         return "Todas";
     }
+    private string GetSelectedAtributo()
+    {
+  
+        if (AtributoComboBox.SelectedItem is LocalDeviceMonitor.App.Modelos.Atributo attr)
+        {
+            return attr.Nome;
+        }
 
-    private static async Task<string> ExecuteCommandAsync(string fileName, string arguments)
+        return "Todos";
+    }
+
+    private static async Task<string> ExecuteCommandAsync(string fileName, string arguments, CancellationToken cancellationToken)
     {
         var psi = new ProcessStartInfo
         {
@@ -2117,9 +2596,25 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 
         using var process = new Process { StartInfo = psi };
         process.Start();
-        var output = await process.StandardOutput.ReadToEndAsync();
-        await process.WaitForExitAsync();
-        return output;
+        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            return await outputTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+            }
+
+            throw;
+        }
     }
 
     private string GetBluetoothCompanyName(ushort companyId)
@@ -2238,7 +2733,7 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 
                 for (int i = 0; i < 4; i++)
                     broadcast[i] = (byte)(ipBytes[i] | ~maskBytes[i]);
-
+                
                 yield return new IPAddress(broadcast);
             }
         }
@@ -2292,9 +2787,91 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
         ThemeToggleButton.Content = "☀️";
     }
 
+
     private void SetBrush(string key, string hexColor)
     {
         Resources[key] = new System.Windows.Media.SolidColorBrush(
             (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(hexColor));
+    }
+
+    private void OpenDetailsWindow_Click(object sender, RoutedEventArgs e)
+    {
+        var device = DevicesGrid.SelectedItem as DeviceInfo;
+        if (device == null)
+        {
+            MessageBox.Show("Selecione um dispositivo para ver os detalhes.", "Detalhes", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"Nome: {device.Name}");
+        sb.AppendLine($"Origem: {device.Origin}");
+        sb.AppendLine($"Tipo: {device.DeviceType}");
+        sb.AppendLine($"Fabricante: {device.Manufacturer}");
+        sb.AppendLine($"MAC: {device.MacAddress}");
+        sb.AppendLine($"IP: {device.IpAddress}");
+        sb.AppendLine($"Estado: {device.Status}");
+        sb.AppendLine($"Protocolo: {device.Protocol}");
+        sb.AppendLine($"Portas: {device.OpenPorts}");
+        sb.AppendLine($"Serviços: {device.DetectedServices}");
+
+        if (device.Rssi.HasValue)
+            sb.AppendLine($"RSSI: {device.Rssi}");
+        if (device.EstimatedDistanceMeters.HasValue)
+            sb.AppendLine($"Distância (m): {device.EstimatedDistanceMeters}");
+
+        sb.AppendLine($"Última deteção: {device.LastSeen}");
+
+        if (device.BacnetDeviceId.HasValue || !string.IsNullOrWhiteSpace(device.BacnetVendorName))
+        {
+            sb.AppendLine($"BACnet ID: {device.BacnetDeviceId}");
+            sb.AppendLine($"BACnet Vendor: {device.BacnetVendorName}");
+            sb.AppendLine($"BACnet Modelo: {device.BacnetModelName}");
+        }
+
+        if (device.ModbusUnitId.HasValue)
+            sb.AppendLine($"Modbus Unit: {device.ModbusUnitId}");
+
+        if (!string.IsNullOrWhiteSpace(device.OnvifXAddr))
+            sb.AppendLine($"ONVIF XAddr: {device.OnvifXAddr}");
+
+        MessageBox.Show(sb.ToString(), "Detalhes do Dispositivo", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void EditDevice_Click(object sender, RoutedEventArgs e)
+    {
+        DeviceInfo? device = (sender as Button)?.DataContext as DeviceInfo
+            ?? DevicesGrid.SelectedItem as DeviceInfo
+            ?? ShadowGrid.SelectedItem as DeviceInfo;
+
+        if (device == null)
+        {
+            MessageBox.Show("Selecione um dispositivo para editar a sua informação.", "Editar", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var editWindow = new EditDeviceWindow(device, _repo) { Owner = this };
+
+        if (editWindow.ShowDialog() == true)
+        {
+            ShowToast("Sucesso", "Detalhes gravados com sucesso!", 3);
+            ApplyFilters();
+
+     
+            DevicesGrid.Items.Refresh();
+            ShadowGrid.Items.Refresh();
+        }
+    }
+    private void BtnDetalhes_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.Tag is DeviceInfo device)
+        {
+            var db = new AssetDatabase();
+            db.EnsureDatabaseCreated();
+
+            var window = new DeviceDetailsWindow(device);
+            window.Owner = this;
+            window.ShowDialog();
+        }
     }
 }

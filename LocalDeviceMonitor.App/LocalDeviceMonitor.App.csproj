@@ -11,9 +11,13 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="BACnet" Version="3.0.2" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.7" />
     <PackageReference Include="NModbus" Version="3.0.81" />
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="10.0.7" />
   </ItemGroup>
   <ItemGroup>
-    <Resource Include="cosmo-logo.png" />
+    <Resource Include="Ressources\cosmo-logo.png" />
   </ItemGroup>
 </Project>

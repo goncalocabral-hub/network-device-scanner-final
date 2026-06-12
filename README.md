@@ -64,6 +64,7 @@ Coordinating scans
 Managing workflows
 Processing discovered data
 Maintaining application state
+
 🔍 Device Discovery Engine
 
 The scanning engine orchestrates multiple discovery modules:
@@ -86,6 +87,7 @@ Aggregating discovered devices
 Normalizing device information
 Maintaining a unified inventory view
 Feeding the UI and analysis modules
+
 📂 Workspace Management
 
 The application supports multiple workspaces, allowing independent monitoring environments.
@@ -112,6 +114,7 @@ Historical device tracking
 Environment evolution monitoring
 Audit and inventory support
 Context preservation between sessions
+
 📋 Baseline Manager
 
 Creates and stores a reference network state.
@@ -121,6 +124,7 @@ Initial baseline creation
 Baseline updates
 Network state preservation
 Comparison against future scans
+
 🚨 Shadow IT Detection
 
 Compares current scan results with the stored baseline.

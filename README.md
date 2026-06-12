@@ -101,7 +101,9 @@ Separate inventories per environment
 Independent scan history
 Example
 Workspace 1 → Company A
+
 Workspace 2 → Company B
+
 Workspace 3 → Test Laboratory
 
 This enables multi-environment asset management from a single application.

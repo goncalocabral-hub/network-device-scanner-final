@@ -56,6 +56,7 @@ Device list (DataGrid)
 Detailed device information panel
 User actions and controls
 Real-time toast notifications
+
 ⚙️ Core Logic Layer
 
 Responsible for:
